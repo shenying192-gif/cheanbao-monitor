@@ -1,0 +1,37 @@
+name: 车安堡充电监控
+
+on:
+  schedule:
+    - cron: '*/4 * * * *'      # 每 4 分钟自动运行一次
+  workflow_dispatch:            # 允许在 Actions 页面手动点“Run workflow”测试
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write           # 允许把更新后的 state.json 提交回仓库
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 运行监控
+        env:
+          USER_ID: ${{ secrets.USER_ID }}
+          API_TOKEN: ${{ secrets.API_TOKEN }}
+          SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
+          MIN_FULL_MINUTES: '330'
+          NOTIFY_START: '1'
+        run: python monitor.py
+
+      - name: 回写状态
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state.json
+          git diff --staged --quiet || git commit -m "update state [skip ci]"
+          git push
