@@ -1,37 +1,32 @@
 name: 车安堡充电监控
-
 on:
   schedule:
-    - cron: '7-59/5 * * * *' # 从第7分钟起每5分钟，错开整点高峰
-  workflow_dispatch:            # 允许在 Actions 页面手动点“Run workflow”测试
-
+    # 每4小时启动一个“常驻job”（在第11分钟，错开整点高峰）
+    # 每个job内部每3分钟查一次、持续跑5小时；新旧job重叠约1小时，无缝衔接
+    - cron: '11 */4 * * *'
+  workflow_dispatch:   # 允许在 Actions 页面手动点“Run workflow”测试
 jobs:
   monitor:
     runs-on: ubuntu-latest
+    timeout-minutes: 330          # 5.5小时兜底（脚本5小时会自己停）
     permissions:
-      contents: write           # 允许把更新后的 state.json 提交回仓库
+      contents: write             # 允许认领通知时把 state.json 提交回仓库
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
-
+        with:
+          fetch-depth: 0
       - name: 安装 Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
-      - name: 运行监控
+      - name: 运行常驻监控
         env:
           USER_ID: ${{ secrets.USER_ID }}
           API_TOKEN: ${{ secrets.API_TOKEN }}
           SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
           MIN_FULL_MINUTES: '330'
           NOTIFY_START: '1'
+          INTERVAL: '180'        # 每3分钟查一次
+          MAX_RUN: '18000'       # 每个job常驻5小时
         run: python monitor.py
-
-      - name: 回写状态
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add state.json
-          git diff --staged --quiet || git commit -m "update state [skip ci]"
-          git push
