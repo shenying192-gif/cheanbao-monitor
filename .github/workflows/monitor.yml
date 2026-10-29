@@ -2,7 +2,7 @@ name: 车安堡充电监控
 
 on:
   schedule:
-    - cron: '*/5 * * * *'      # 每 5 分钟自动运行一次
+    - cron: '7-59/5 * * * *' # 从第7分钟起每5分钟，错开整点高峰
   workflow_dispatch:            # 允许在 Actions 页面手动点“Run workflow”测试
 
 jobs:
