@@ -1,13 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-车安堡充电监控（GitHub Actions 云端版）
-每次由定时任务触发运行一次：查询当前充电状态 -> 与 state.json 对比 ->
-检测到充电开始 / 提前结束（被拔）就通过 Server酱 推送到微信。
+车安堡充电监控（GitHub Actions 常驻版）
+- 每次 job 启动后进入常驻循环：每 INTERVAL 秒（默认180秒）查一次，
+  最多跑 MAX_RUN 秒（默认5小时，低于 GitHub 单 job 6小时上限）。
+- 定时任务每 4 小时启动一个新 job，与旧 job 重叠约 1 小时，
+  即使定时被 GitHub 延迟，也能无缝衔接，绝大多数时间都有 job 在密集监控。
+- 状态机检测充电开始 / 提前结束（被拔），通过 Server酱 推送到微信。
+- 通知去重：发通知前先在远程 state.json 里“认领”该订单（git push 成功为准），
+  保证重叠的两个 job 不会重复发同一条通知。
 个人信息全部来自环境变量（仓库 Secrets），本文件不含任何隐私。
 """
 import json
 import os
 import re
+import subprocess
 import time
 import urllib.parse
 import urllib.request
@@ -22,10 +28,14 @@ API_TOKEN = os.environ.get("API_TOKEN", "")
 SERVERCHAN_KEY = os.environ.get("SERVERCHAN_KEY", "")
 MIN_FULL_MINUTES = int(os.environ.get("MIN_FULL_MINUTES", "330"))
 NOTIFY_START = os.environ.get("NOTIFY_START", "1") == "1"
+INTERVAL = int(os.environ.get("INTERVAL", "180"))          # 每3分钟查一次
+MAX_RUN = int(os.environ.get("MAX_RUN", str(5 * 3600)))    # 单次最多跑5小时
+KEEP = 20                                                   # 去重列表最多保留条数
 
 
 def log(msg):
-    print("[%s] %s" % (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), msg))
+    print("[%s] %s" % (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), msg),
+          flush=True)
 
 
 def api(path, payload):
@@ -37,11 +47,17 @@ def api(path, payload):
         return json.loads(resp.read().decode("utf-8"))
 
 
-def get_charging():
+def get_status():
+    """返回 (是否充电中, 当前订单号)。"""
     r = api("/api/getCurrentRechargeMobile", {"id": int(USER_ID)})
     if r.get("code") != 200:
         raise RuntimeError("接口异常: %s" % json.dumps(r, ensure_ascii=False))
-    return r["data"].get("isOrderOn") == 1
+    d = r["data"]
+    charging = d.get("isOrderOn") == 1
+    order_id = ""
+    if charging and isinstance(d.get("orderInfo"), dict):
+        order_id = d["orderInfo"].get("order_id", "")
+    return charging, order_id
 
 
 def get_latest_order():
@@ -69,23 +85,75 @@ def serverchan(title, desp):
         "https://sctapi.ftqq.com/%s.send" % SERVERCHAN_KEY, data=data)
     with urllib.request.urlopen(req, timeout=15) as resp:
         resp.read()
-    log("Server酱推送成功")
+    log("Server酱推送成功：%s" % title)
 
 
 def load_state():
     if os.path.exists(STATE_PATH):
-        with open(STATE_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {"charging": False}
+        try:
+            with open(STATE_PATH, "r", encoding="utf-8") as f:
+                s = json.load(f)
+            s.setdefault("charging", False)
+            s.setdefault("active_order", "")
+            s.setdefault("notified_start", [])
+            s.setdefault("notified_end", [])
+            return s
+        except Exception:
+            pass
+    return {"charging": False, "active_order": "",
+            "notified_start": [], "notified_end": []}
 
 
-def save_state(charging):
+def save_state(s):
     with open(STATE_PATH, "w", encoding="utf-8") as f:
-        json.dump({"charging": bool(charging)}, f, ensure_ascii=False, indent=2)
+        json.dump(s, f, ensure_ascii=False, indent=2)
+
+
+def trim(lst):
+    return lst[-KEEP:]
+
+
+# ---------------- git 操作 ----------------
+def git(*args):
+    try:
+        r = subprocess.run(["git", *args], capture_output=True,
+                           text=True, timeout=90)
+        return r.returncode == 0, (r.stdout + r.stderr)
+    except Exception as e:
+        return False, str(e)
+
+
+def try_claim(order_id, kind):
+    """
+    为订单 order_id 认领 kind（start / end）通知。
+    以远程仓库最新 state 为准，git push 成功即认领成功（原子），
+    重叠的另一个 job 会因订单已被认领而返回 False。
+    """
+    if not order_id:
+        return False
+    key = "notified_" + kind
+    for attempt in range(4):
+        git("fetch", "origin")
+        git("reset", "--hard", "origin/main")   # 以远程最新状态为准
+        s = load_state()
+        if order_id in s.get(key, []):
+            log("订单 %s 的 %s 通知已被认领，跳过" % (order_id, kind))
+            return False
+        s[key] = trim(s.get(key, []) + [order_id])
+        save_state(s)
+        git("add", "state.json")
+        git("commit", "-m", "claim %s %s [skip ci]" % (kind, order_id))
+        ok, _ = git("push")
+        if ok:
+            log("已认领订单 %s 的 %s 通知" % (order_id, kind))
+            return True
+        log("push 冲突，重试认领（第%d次）" % (attempt + 1))
+        time.sleep(1.5)
+    return False
 
 
 def report_end():
-    time.sleep(2)
+    time.sleep(3)  # 等结束订单在服务端落库
     try:
         order = get_latest_order()
     except Exception as e:
@@ -115,22 +183,48 @@ def report_end():
 
 
 def main():
-    charging = get_charging()
-    was_charging = load_state().get("charging", False)
-    log("当前充电中=%s，上次记录=%s" % (charging, was_charging))
+    s = load_state()
+    # 冷启动兜底：若远程记录显示在充电，就以“充电中”起步，避免漏判
+    charging, order_id = False, ""
+    try:
+        charging, order_id = get_status()
+    except Exception as e:
+        log("首次查询失败，沿用本地状态: %s" % e)
+        charging = s.get("charging", False)
+    s["charging"] = charging
+    if charging and order_id:
+        s["active_order"] = order_id
+    log("常驻监控启动：充电中=%s，订单=%s，间隔=%ds，最长跑%ds"
+        % (charging, s.get("active_order"), INTERVAL, MAX_RUN))
 
-    if charging and not was_charging:
-        # 刚刚开始充电
-        save_state(True)
-        if NOTIFY_START:
-            serverchan("电动车开始充电",
-                       "云端监控已启动，万一被拔，几分钟内微信通知你。")
-    elif (not charging) and was_charging:
-        # 刚刚结束
-        save_state(False)
-        report_end()
-    else:
-        save_state(charging)
+    run_start = time.time()
+    while time.time() - run_start < MAX_RUN:
+        try:
+            charging, order_id = get_status()
+            was = s["charging"]
+            if charging and not was:
+                # 开始充电
+                oid = order_id or ("T" + datetime.now().strftime("%Y%m%d%H%M"))
+                s["active_order"] = oid
+                s["charging"] = True
+                if try_claim(oid, "start"):
+                    if NOTIFY_START:
+                        serverchan("电动车开始充电",
+                                   "云端监控已启动，万一被拔，几分钟内微信通知你。")
+            elif (not charging) and was:
+                # 充电结束
+                oid = s.get("active_order", "")
+                s["charging"] = False
+                s["active_order"] = ""
+                if try_claim(oid, "end"):
+                    report_end()
+            elif charging and order_id:
+                s["active_order"] = order_id
+        except Exception as e:
+            log("本轮异常（下一轮继续）: %s" % e)
+        time.sleep(INTERVAL)
+
+    log("本次常驻时长已到（%ds），job 结束，等待下一个 job 接管" % MAX_RUN)
 
 
 if __name__ == "__main__":
